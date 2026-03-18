@@ -44,7 +44,7 @@ from typing import Optional, Dict, List
 
 # ── Paths ───────────────────────────────────────────────────────
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 BUS_DIR = os.environ.get("AMB_BUS_DIR", os.path.join(_SCRIPT_DIR, "bus"))
 PEERS_FILE = os.environ.get("AMB_PEERS_FILE",
                              os.path.join(_SCRIPT_DIR, "peers.json"))

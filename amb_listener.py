@@ -23,7 +23,7 @@ import socket
 import sys
 import time
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 BUS_DIR = os.environ.get("AMB_BUS_DIR", os.path.join(_SCRIPT_DIR, "bus"))
 
 
