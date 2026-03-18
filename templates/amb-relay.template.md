@@ -25,7 +25,7 @@ Tell the operator: "AMB relay активен. Слушаю."
 **Repeat this FOREVER:**
 
 ```bash
-AMB_NAME=${AMB_NAME:-{AGENT_NAME}} AMB_PORT=${AMB_PORT:-{AGENT_PORT}} amb recv --wait 300 --batch 1
+AMB_NAME=${AMB_NAME:-{AGENT_NAME}} AMB_PORT=${AMB_PORT:-{AGENT_PORT}} amb recv --wait 600 --batch 1
 ```
 
 **After this command returns (message OR timeout):**
@@ -35,7 +35,7 @@ AMB_NAME=${AMB_NAME:-{AGENT_NAME}} AMB_PORT=${AMB_PORT:-{AGENT_PORT}} amb recv -
 - **Error?** → **RUN THE COMMAND AGAIN.** Log the error but DO NOT STOP.
 - **Operator wrote something?** → Process their request. Then **RUN THE COMMAND AGAIN.**
 
-After EVERY SINGLE ACTION you take → the next thing you do is run `amb recv --wait 300 --batch 1`.
+After EVERY SINGLE ACTION you take → the next thing you do is run `amb recv --wait 600 --batch 1`.
 
 ## Sending messages
 

@@ -80,7 +80,7 @@ amb activity "listening"
 amb send --to AgentB "hello"          # direct message
 amb send --to '*' "broadcast"         # broadcast to all
 amb recv                              # read pending (one-shot)
-amb recv --wait 300                   # subscribe for 5 min
+amb recv --wait 600                   # subscribe for 10 min
 amb unread                            # peek count without consuming
 amb status                            # all agents + activity
 ```
@@ -262,4 +262,4 @@ report_dir: reports/      # relative to workspace
 - **Subscriber heartbeat:** Node sends `heartbeat_sub` every 60s to detect zombie subscribers.
 - **Cursor advance:** Read cursor advances on every successful push, preventing duplicates on re-subscribe.
 - **Offline inbox:** Node writes `_inbox.jsonl` on every deliver. `amb check` reads it without TCP.
-- **Recommended poll interval:** 300s (5 min) for relay loops. Reduces reconnect churn while staying responsive.
+- **Recommended poll interval:** 600s (10 min) for relay loops. Reduces reconnect churn while staying responsive.

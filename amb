@@ -195,7 +195,7 @@ def cmd_start(args):
         os.path.join(_SCRIPT_DIR, "amb_node.py"),
         "--name", NAME,
         "--port", str(PORT),
-        "--host", "0.0.0.0",
+        "--host", HOST,
         "--announce-host", announce_host,
     ]
     log = os.path.join(PID_DIR, f"{NAME}.log")
@@ -213,7 +213,7 @@ def cmd_start(args):
     time.sleep(0.5)
     try:
         os.kill(proc.pid, 0)
-        print(f"Node started: {NAME} @ 0.0.0.0:{PORT} (PID {proc.pid})")
+        print(f"Node started: {NAME} @ {HOST}:{PORT} (PID {proc.pid})")
         print(f"Log: {log}")
     except OSError:
         print("Node failed to start. Check log:", log, file=sys.stderr)
