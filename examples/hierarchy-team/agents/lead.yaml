@@ -1,0 +1,6 @@
+name: Lead
+port: 15000
+workspace: /home/user/lead-workspace
+role: CTO / Architect
+report_dir: reports
+recv_timeout: 600

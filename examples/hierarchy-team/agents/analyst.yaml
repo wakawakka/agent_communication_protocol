@@ -1,0 +1,6 @@
+name: Analyst
+port: 15002
+workspace: /home/user/analyst-workspace
+role: Research + Review
+report_dir: docs/reviews
+recv_timeout: 600

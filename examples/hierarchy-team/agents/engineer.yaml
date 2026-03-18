@@ -1,0 +1,6 @@
+name: Engineer
+port: 15001
+workspace: /home/user/engineer-workspace
+role: Developer + QA
+report_dir: reports
+recv_timeout: 600
