@@ -1,0 +1,625 @@
+#!/usr/bin/env python3
+"""
+AMB CLI — клиент mesh-сети агентов.
+
+Каждый агент = узел со своим портом. Сообщения доставляются напрямую.
+
+Использование:
+    # Запустить свой узел (фоном):
+    amb start --name Alice --port 15000
+
+    # Отправить сообщение напрямую другому агенту:
+    amb send --to Bob "текст сообщения"
+
+    # Отправить всем:
+    amb send --to '*' "broadcast"
+
+    # Получить непрочитанные (однократно):
+    amb recv
+
+    # Подписаться на live-поток (пуш в реальном времени):
+    amb recv --follow
+
+    # Ждать сообщение с таймаутом:
+    amb recv --wait 60
+
+    # Кто в сети:
+    amb peers
+
+    # Проверить свой узел:
+    amb ping
+
+    # Остановить свой узел:
+    amb stop
+
+Переменные окружения:
+    AMB_NAME    — имя агента (обязательно)
+    AMB_PORT    — порт своего узла (обязательно)
+    AMB_HOST    — хост для подключения к себе (default: 127.0.0.1)
+"""
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+import uuid
+from typing import Optional
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PEERS_FILE = os.environ.get("AMB_PEERS_FILE",
+                             os.path.join(_SCRIPT_DIR, "peers.json"))
+NAME = os.environ.get("AMB_NAME", "")
+PORT = int(os.environ.get("AMB_PORT", "0"))
+HOST = os.environ.get("AMB_HOST", "127.0.0.1")
+PID_DIR = os.environ.get("AMB_BUS_DIR", os.path.join(_SCRIPT_DIR, "bus"))
+
+
+# ── Helpers ─────────────────────────────────────────────────────
+
+def load_peers() :
+    if not os.path.exists(PEERS_FILE):
+        return {}
+    try:
+        with open(PEERS_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def connect_to(host: str, port: int, timeout: float = 5) :
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    sock.connect((host, port))
+    return sock
+
+
+def send_pkt(sock: socket.socket, obj: dict):
+    line = json.dumps(obj, ensure_ascii=False) + "\n"
+    sock.sendall(line.encode("utf-8"))
+
+
+def recv_pkt(sock: socket.socket, timeout: float = 10) :
+    old = sock.gettimeout()
+    sock.settimeout(timeout)
+    try:
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return None
+            buf += chunk
+        line = buf.split(b"\n", 1)[0]
+        return json.loads(line.decode("utf-8", errors="replace"))
+    except (socket.timeout, ConnectionError, OSError):
+        return None
+    finally:
+        sock.settimeout(old)
+
+
+def recv_lines(sock, timeout=10):
+    """Receive all available JSON lines until timeout or read_end."""
+    results = []
+    sock.settimeout(timeout)
+    buf = b""
+    try:
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                pkt = json.loads(line.decode("utf-8", errors="replace"))
+                if pkt.get("op") == "read_end":
+                    return results
+                results.append(pkt)
+    except socket.timeout:
+        pass
+    return results
+
+
+def print_msg(pkt: dict):
+    op = pkt.get("op")
+    if op == "msg":
+        ts = pkt.get("ts", 0)
+        t = time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "??:??:??"
+        frm = pkt.get("from", "?")
+        body = pkt.get("body", "")
+        print(f"[{t}] {frm}: {body}")
+    elif op == "ack":
+        msg_id = pkt.get("id", "?")
+        print(f"  ✓ доставлено id={msg_id}", file=sys.stderr)
+    elif op == "peers_result":
+        peers = pkt.get("peers", {})
+        if not peers:
+            print("(нет пиров)")
+        else:
+            for name, info in peers.items():
+                print(f"  {name}: {info['host']}:{info['port']}")
+    elif op == "pong":
+        n = pkt.get("name", "?")
+        sz = pkt.get("inbox_size", 0)
+        print(f"  {n}: alive, inbox={sz}")
+    elif op == "error":
+        print(f"[ERROR] {pkt.get('msg')}", file=sys.stderr)
+
+
+def my_node():
+    """Get own node host:port."""
+    if PORT:
+        return HOST, PORT
+    # Try peers file
+    peers = load_peers()
+    if NAME in peers:
+        return peers[NAME].get("host", HOST), peers[NAME]["port"]
+    print("AMB_PORT not set and not in peers file", file=sys.stderr)
+    sys.exit(1)
+
+
+def pid_file():
+    return os.path.join(PID_DIR, f"{NAME}.pid")
+
+
+# ── Commands ────────────────────────────────────────────────────
+
+def cmd_start(args):
+    """Start own node as a background daemon."""
+    if not NAME or not PORT:
+        print("AMB_NAME and AMB_PORT required", file=sys.stderr)
+        sys.exit(1)
+
+    os.makedirs(PID_DIR, exist_ok=True)
+
+    # Check if already running
+    pf = pid_file()
+    if os.path.exists(pf):
+        with open(pf) as f:
+            old_pid = int(f.read().strip())
+        try:
+            os.kill(old_pid, 0)
+            print(f"Node already running (PID {old_pid})")
+            return
+        except OSError:
+            os.remove(pf)
+
+    announce_host = HOST
+    for i, a in enumerate(args):
+        if a == "--announce-host" and i + 1 < len(args):
+            announce_host = args[i + 1]
+
+    # Launch node in background
+    cmd = [
+        sys.executable,
+        os.path.join(_SCRIPT_DIR, "amb_node.py"),
+        "--name", NAME,
+        "--port", str(PORT),
+        "--host", "0.0.0.0",
+        "--announce-host", announce_host,
+    ]
+    log = os.path.join(PID_DIR, f"{NAME}.log")
+    with open(log, "a") as logf:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    with open(pf, "w") as f:
+        f.write(str(proc.pid))
+
+    # Wait a moment and verify
+    time.sleep(0.5)
+    try:
+        os.kill(proc.pid, 0)
+        print(f"Node started: {NAME} @ 0.0.0.0:{PORT} (PID {proc.pid})")
+        print(f"Log: {log}")
+    except OSError:
+        print("Node failed to start. Check log:", log, file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_stop():
+    """Stop own node."""
+    pf = pid_file()
+    if not os.path.exists(pf):
+        print("No running node found")
+        return
+    with open(pf) as f:
+        pid = int(f.read().strip())
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print(f"Node stopped (PID {pid})")
+    except OSError as e:
+        print(f"Could not stop PID {pid}: {e}")
+    os.remove(pf)
+
+
+def cmd_send(args):
+    """Send a message to another agent (direct P2P)."""
+    if not NAME:
+        print("AMB_NAME required", file=sys.stderr)
+        sys.exit(1)
+
+    to = ""
+    body_parts = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--to" and i + 1 < len(args):
+            to = args[i + 1]
+            i += 2
+        else:
+            body_parts.append(args[i])
+            i += 1
+
+    body = " ".join(body_parts)
+    if not body:
+        body = sys.stdin.read().strip()
+    if not body:
+        print("Empty message", file=sys.stderr)
+        sys.exit(1)
+    if not to:
+        print("--to required", file=sys.stderr)
+        sys.exit(1)
+
+    msg_id = str(uuid.uuid4())[:8]
+    pkt = {
+        "op": "deliver",
+        "from": NAME,
+        "id": msg_id,
+        "body": body,
+        "ts": time.time(),
+    }
+
+    peers = load_peers()
+
+    if to == "*":
+        # Broadcast: send to all peers except self
+        delivered_to = []
+        for pname, info in peers.items():
+            if pname == NAME:
+                continue
+            try:
+                sock = connect_to(info["host"], info["port"], timeout=3)
+                send_pkt(sock, pkt)
+                resp = recv_pkt(sock, timeout=3)
+                sock.close()
+                if resp and resp.get("op") == "ack":
+                    delivered_to.append(pname)
+            except (ConnectionError, OSError):
+                print(f"  ⚠ {pname} offline", file=sys.stderr)
+        if delivered_to:
+            print(f"  ✓ Доставлено: {', '.join(delivered_to)}")
+        else:
+            print("  ⚠ Никому не доставлено (все offline)")
+    else:
+        # Unicast
+        if to not in peers:
+            print(f"Unknown peer: {to}. Known: {', '.join(peers.keys())}",
+                  file=sys.stderr)
+            sys.exit(1)
+        info = peers[to]
+        try:
+            sock = connect_to(info["host"], info["port"], timeout=5)
+            send_pkt(sock, pkt)
+            resp = recv_pkt(sock, timeout=5)
+            sock.close()
+            if resp:
+                print_msg(resp)
+        except (ConnectionError, OSError) as e:
+            print(f"  ⚠ {to} offline ({e})", file=sys.stderr)
+            sys.exit(1)
+
+
+def cmd_recv(args):
+    """Receive messages from own node."""
+    h, p = my_node()
+
+    mode = "read"  # default: one-shot read
+    wait_time = 60
+    batch_size = 0  # 0 = unlimited
+    for i, a in enumerate(args):
+        if a == "--follow":
+            mode = "subscribe"
+        elif a == "--wait":
+            mode = "wait"
+            if i + 1 < len(args):
+                try:
+                    wait_time = int(args[i + 1])
+                except ValueError:
+                    pass
+        elif a == "--batch":
+            # Return after N messages (for subagent pattern)
+            if i + 1 < len(args):
+                try:
+                    batch_size = int(args[i + 1])
+                except ValueError:
+                    batch_size = 1
+
+    sock = connect_to(h, p)
+
+    # TCP keepalive for long-lived subscribe connections
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+    except (AttributeError, OSError):
+        pass  # Non-Linux
+
+    if mode == "read":
+        send_pkt(sock, {"op": "read"})
+        msgs = recv_lines(sock, timeout=5)
+        for m in msgs:
+            print_msg(m)
+        if not msgs:
+            print("  (нет непрочитанных)")
+        sock.close()
+
+    elif mode == "subscribe" or mode == "wait":
+        send_pkt(sock, {"op": "subscribe"})
+        timeout = 86400 if mode == "subscribe" else wait_time
+
+        sock.settimeout(1.0)  # 1s poll for interruptibility
+        buf = b""
+        deadline = time.time() + timeout
+        msg_count = 0
+        try:
+            while time.time() < deadline:
+                try:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        print("  (node disconnected)", file=sys.stderr)
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        pkt = json.loads(
+                            line.decode("utf-8", errors="replace"))
+                        if pkt.get("op") in ("subscribed", "heartbeat_sub"):
+                            continue
+                        print_msg(pkt)
+                        sys.stdout.flush()
+                        msg_count += 1
+                        if batch_size > 0 and msg_count >= batch_size:
+                            sock.close()
+                            return
+                except socket.timeout:
+                    continue
+        except KeyboardInterrupt:
+            pass
+        sock.close()
+
+
+def cmd_peers():
+    """Show known peers (from file + ping alive check)."""
+    peers = load_peers()
+    if not peers:
+        print("(нет пиров)")
+        return
+    for name, info in peers.items():
+        host, port = info["host"], info["port"]
+        try:
+            sock = connect_to(host, port, timeout=1)
+            send_pkt(sock, {"op": "ping"})
+            resp = recv_pkt(sock, timeout=1)
+            sock.close()
+            status = "● online" if resp else "○ ?"
+            inbox_sz = resp.get("inbox_size", "?") if resp else "?"
+            marker = " ← (я)" if name == NAME else ""
+            print(f"  {status}  {name}: {host}:{port} "
+                  f"(inbox: {inbox_sz}){marker}")
+        except (ConnectionError, OSError):
+            print(f"  ○ offline  {name}: {host}:{port}")
+
+
+def cmd_ping():
+    """Ping own node."""
+    h, p = my_node()
+    try:
+        sock = connect_to(h, p, timeout=2)
+        send_pkt(sock, {"op": "ping"})
+        resp = recv_pkt(sock, timeout=2)
+        sock.close()
+        if resp:
+            print_msg(resp)
+        else:
+            print("No response")
+    except (ConnectionError, OSError) as e:
+        print(f"Node not reachable: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_activity(args):
+    """Set current activity status."""
+    if not NAME:
+        print("AMB_NAME required", file=sys.stderr)
+        sys.exit(1)
+    text = " ".join(args) if args else "idle"
+    h, p = my_node()
+    try:
+        sock = connect_to(h, p, timeout=3)
+        send_pkt(sock, {"op": "set_activity", "text": text})
+        resp = recv_pkt(sock, timeout=3)
+        sock.close()
+        if resp:
+            print(f"  Activity: {resp.get('text', text)}")
+    except (ConnectionError, OSError) as e:
+        print(f"Node not reachable: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_status():
+    """Full health check with heartbeat status and activity of all peers."""
+    h, p = my_node()
+    try:
+        sock = connect_to(h, p, timeout=3)
+        send_pkt(sock, {"op": "status"})
+        resp = recv_pkt(sock, timeout=3)
+        sock.close()
+        if not resp or resp.get("op") != "status_result":
+            print("No status response")
+            return
+
+        name = resp.get("name", "?")
+        inbox_sz = resp.get("inbox_size", 0)
+        has_sub = resp.get("subscriber", False)
+        uptime = resp.get("uptime", 0)
+        own_activity = resp.get("activity", "?")
+        peers = resp.get("peers", {})
+
+        uptime_m = int(uptime // 60)
+        uptime_s = int(uptime % 60)
+        sub_str = "● relay active" if has_sub else "○ NO RELAY"
+        print(f"  {name}: [{own_activity}] inbox={inbox_sz}, {sub_str}, "
+              f"uptime={uptime_m}m{uptime_s}s")
+
+        # Activity history
+        act_log = resp.get("activity_log", [])
+        if act_log:
+            print(f"  History:")
+            for entry in act_log:
+                ats = entry.get("ts", 0)
+                at = time.strftime("%H:%M:%S", time.localtime(ats)) if ats else "?"
+                print(f"    {at}: {entry.get('text', '?')}")
+
+        print()
+        for pname, info in peers.items():
+            if not isinstance(info, dict):
+                print(f"    {pname}: {info}")
+                continue
+            status = info.get("status", "?")
+            activity = info.get("activity", "?")
+            act_age = info.get("activity_age", 0)
+
+            if pname == name:
+                print(f"    {pname} (я): [{activity}]")
+            elif status == "alive":
+                last = info.get("last_seen", 0)
+                age_str = f"{act_age}s" if act_age < 120 else f"{act_age // 60}m"
+                print(f"    ● {pname}: [{activity}] (hb {last}s, act {age_str})")
+            elif status == "DEAD":
+                last = info.get("last_seen", 0)
+                print(f"    ✗ {pname}: DEAD ({last}s, was: [{activity}])")
+            else:
+                print(f"    ○ {pname}: {status}")
+
+    except (ConnectionError, OSError) as e:
+        print(f"Node not reachable: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_unread():
+    """Show unread message count (via peek op, no consumption)."""
+    h, p = my_node()
+    try:
+        sock = connect_to(h, p, timeout=3)
+        send_pkt(sock, {"op": "peek"})
+        resp = recv_pkt(sock, timeout=3)
+        sock.close()
+        if resp and resp.get("op") == "peek_result":
+            unread = resp.get("unread", 0)
+            total = resp.get("total", 0)
+            last_from = resp.get("last_from", "")
+            if unread > 0:
+                print(f"  {unread} unread (total: {total}, last from: {last_from})")
+            else:
+                print(f"  0 unread (total: {total})")
+        else:
+            print("No response from node")
+    except (ConnectionError, OSError) as e:
+        print(f"Node not reachable: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_check():
+    """Check inbox file written by amb_listener (no network needed)."""
+    if not NAME:
+        print("AMB_NAME required", file=sys.stderr)
+        sys.exit(1)
+
+    inbox = os.path.join(PID_DIR, f"{NAME}_inbox.jsonl")
+    cursor = os.path.join(PID_DIR, f"{NAME}_cursor")
+
+    # Read cursor (last read position)
+    last_pos = 0
+    if os.path.exists(cursor):
+        with open(cursor) as f:
+            try:
+                last_pos = int(f.read().strip())
+            except ValueError:
+                last_pos = 0
+
+    if not os.path.exists(inbox):
+        print("  (нет входящих)")
+        return
+
+    # Read new messages from cursor
+    new_msgs = []
+    with open(inbox, "r") as f:
+        f.seek(last_pos)
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                pkt = json.loads(line)
+                new_msgs.append(pkt)
+            except json.JSONDecodeError:
+                continue
+        new_pos = f.tell()
+
+    if not new_msgs:
+        print("  (нет новых сообщений)")
+        return
+
+    for pkt in new_msgs:
+        print_msg(pkt)
+
+    # Update cursor
+    with open(cursor, "w") as f:
+        f.write(str(new_pos))
+
+    print(f"  ({len(new_msgs)} новых)", file=sys.stderr)
+
+
+# ── Main ────────────────────────────────────────────────────────
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    rest = sys.argv[2:]
+
+    if cmd == "start":
+        cmd_start(rest)
+    elif cmd == "stop":
+        cmd_stop()
+    elif cmd == "send":
+        cmd_send(rest)
+    elif cmd == "recv":
+        cmd_recv(rest)
+    elif cmd == "check":
+        cmd_check()
+    elif cmd == "unread":
+        cmd_unread()
+    elif cmd == "peers":
+        cmd_peers()
+    elif cmd == "ping":
+        cmd_ping()
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "activity":
+        cmd_activity(rest)
+    else:
+        print(f"Unknown command: {cmd}", file=sys.stderr)
+        print("Commands: start, stop, send, recv, check, unread, peers, "
+              "ping, status, activity", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

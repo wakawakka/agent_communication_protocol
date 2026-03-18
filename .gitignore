@@ -1,0 +1,19 @@
+# Runtime state (created by amb_node.py)
+bus/
+*.pid
+
+# Agent configs (project-specific)
+agents/*.yaml
+!agents/example.yaml
+
+# Project-specific data
+threads/
+archive/
+deliverables/
+!deliverables/README.md
+peers.json
+BOARD.md
+
+# Python
+*.pyc
+__pycache__/

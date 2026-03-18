@@ -1,0 +1,9 @@
+# Example agent configuration
+# Copy this file, rename to your-agent.yaml, and edit.
+# Then run: bash templates/setup.sh
+
+name: Alice                      # Agent name (used in AMB messages)
+port: 15000                      # TCP port for this agent's daemon
+workspace: /home/user/alice      # Path to agent's workspace (where .claude/ lives)
+role: developer                  # Role description (for documentation)
+report_dir: reports              # Directory for task output files (relative to workspace)
