@@ -31,6 +31,8 @@ process_agent() {
     workspace="$(yaml_val "$config" workspace)"
     role="$(yaml_val "$config" role)"
     report_dir="$(yaml_val "$config" report_dir)"
+    recv_timeout="$(yaml_val "$config" recv_timeout)"
+    recv_timeout="${recv_timeout:-600}"  # default 600s (10 min)
 
     if [ -z "$name" ] || [ -z "$port" ] || [ -z "$workspace" ]; then
         echo "  SKIP: $config (missing name, port, or workspace)"
@@ -49,6 +51,7 @@ process_agent() {
     mkdir -p "$workspace/.claude/skills/amb-relay"
     sed -e "s|{AGENT_NAME}|$name|g" \
         -e "s|{AGENT_PORT}|$port|g" \
+        -e "s|{RECV_TIMEOUT}|$recv_timeout|g" \
         "$TEMPLATE_SKILL" > "$workspace/.claude/skills/amb-relay/SKILL.md"
 
     # Create report directory
