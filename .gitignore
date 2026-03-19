@@ -17,3 +17,5 @@ BOARD.md
 # Python
 *.pyc
 __pycache__/
+amb_peers.json
+config_drift_resolution.md

@@ -1,4 +1,4 @@
-# AMB — Agent Message Bus Protocol v4.1
+# AMB — Agent Message Bus Protocol v5.0
 
 A peer-to-peer TCP mesh protocol for LLM agent collaboration.
 
@@ -14,6 +14,10 @@ AMB enables multiple Claude Code (or other LLM) agents to communicate in real-ti
 - Offline delivery — messages wait in inbox until agent reconnects
 - Activity tracking — each agent broadcasts what it's working on
 - Sub-second latency for online agents
+- Background task tracking — delegating agent monitors completion
+- Background AMB listener — agent stays reachable during long tasks
+- Mandatory cross-review — every change reviewed by another agent
+- Post-incident learning — mistakes feed back into team knowledge
 
 ---
 
@@ -164,15 +168,73 @@ CAUSE: [root cause]
 SUGGESTION: [proposed fix]
 ```
 
-### Task Watcher
+### Background Task Tracker (MANDATORY)
 
-When delegating, the lead agent SHOULD launch a background watcher:
+When delegating a task, the lead agent MUST launch a background subagent to track completion. This prevents fire-and-forget delegation where tasks silently die.
+
+**Pattern for Claude Code agents:**
+
 ```
-1. Send task via AMB
-2. Launch background subagent:
-   "Watch for output file {path} or AMB 'Done' from {agent}.
-    Check every 30s, timeout 5 min."
+After sending the AMB task, immediately call:
+
+Agent tool:
+  description: "Track task [short name]"
+  run_in_background: true
+  prompt: |
+    You are a task tracker. Monitor AMB for a response to a delegated task.
+
+    TASK DETAILS:
+    - Sent to: [AgentName]
+    - Subject: [task description]
+    - Deadline: [date]
+
+    MONITORING LOOP:
+    1. Run: AMB_NAME=${AMB_NAME} AMB_PORT=${AMB_PORT} amb recv --wait 300 --batch 1
+    2. If you receive a message from [AgentName] about this task:
+       - Acknowledgment ("Accepted") → note it, continue monitoring for result
+       - Result ("Done: [path]") → report to operator:
+         "[AgentName] completed: [task]. Result: [path]. Needs cross-review."
+       - Question or blocker → report to operator immediately
+    3. If 30 minutes pass with no acknowledgment → alert operator
+    4. If deadline passes without result → escalate to operator
+    5. After receiving result OR escalating → stop.
+
+    Between polls, just wait. Do not do any other work.
 ```
+
+**Why this matters:** Without a tracker, delegated tasks disappear into the void. The tracker ensures every task gets acknowledged, monitored, and closed.
+
+---
+
+## Background AMB Listener
+
+When an agent starts a long task (>5 minutes), it becomes unreachable via AMB — corrections, priority changes, and new tasks go unnoticed. The solution: launch a background listener before starting work.
+
+**Pattern for Claude Code agents:**
+
+```
+Before starting the main work, call:
+
+Agent tool:
+  description: "AMB listener"
+  run_in_background: true
+  prompt: |
+    You are an AMB listener running in the background while the main agent works.
+
+    LISTENING LOOP:
+    1. Run: AMB_NAME=${AMB_NAME} AMB_PORT=${AMB_PORT} amb recv --wait 300 --batch 1
+    2. If you receive a message:
+       - Correction/priority change → report to operator IMMEDIATELY
+       - New task → report: "New task from [sender]. Main agent busy with [task]."
+       - Status request → reply via AMB: "Working on [task]. ETA: [estimate]."
+       - Question → answer if possible, otherwise report to operator
+    3. Run amb recv again. Repeat until main work completes.
+
+    You are PASSIVE — only listen and relay. Do not start new work.
+```
+
+**When to launch:** any implementation task, multi-step analysis, or task >5 minutes.
+**When NOT to launch:** quick operations (<2 min), already in relay mode, during short cross-review.
 
 ---
 
@@ -263,3 +325,68 @@ report_dir: reports/      # relative to workspace
 - **Cursor advance:** Read cursor advances on every successful push, preventing duplicates on re-subscribe.
 - **Offline inbox:** Node writes `_inbox.jsonl` on every deliver. `amb check` reads it without TCP.
 - **Recommended poll interval:** 600s (10 min) for relay loops. Reduces reconnect churn while staying responsive.
+
+---
+
+## Cross-Review Protocol
+
+Every significant change must be reviewed by another agent before acceptance. This is not optional — unreviewed changes are rejected.
+
+### Review Matrix
+
+| Change type | Author | Reviewer | What to check |
+|-------------|--------|----------|---------------|
+| Code (C++, configs) | Dev agent | Research agent | Correctness, safety, spec compliance, root cause |
+| Research (audits, specs) | Research agent | Dev agent | Implementability, edge cases, hardware realism |
+| Architecture decisions | Architect | Both agents | Evidence basis, alternatives, feasibility |
+| Agent configs | Coach | Affected agent | No workflow breakage, budget compliance |
+
+### Review Process
+
+1. Author completes work → sends AMB: "Готово: [path]. Прошу кросс-ревью."
+2. Reviewer reads the deliverable
+3. Reviewer sends feedback via AMB (short) or file (detailed):
+   - `APPROVE: [what was verified, caveats if any]`
+   - `NEEDS CHANGES: [specific issues with file:line references]`
+   - `REJECT: [fundamental problems, alternative approach suggested]`
+4. Author addresses feedback or argues with evidence
+5. After approval → task can be closed
+
+### Dispute Resolution
+
+Disagreement between agents is **healthy and expected**. Resolution protocol:
+
+1. Both sides state their position with **evidence** (measurements, source code, calculations)
+2. If unresolved after 2 rounds → escalate to human operator with both positions documented
+3. Only the human operator overrides an agent's reasoned objection
+4. Every resolution must be documented (AMB thread or file)
+
+**Red flag:** If an agent accepts everything without pushback — something is wrong. Challenge silence.
+
+---
+
+## Team Learning Protocol
+
+Agents must learn from mistakes — their own and each other's.
+
+### Post-Incident
+
+After any bug, crash, failed approach, or rejected deliverable:
+
+1. **Root cause analysis** — not "what broke" but "why the system allowed it to break"
+   - Use 5 Whys: symptom → cause → cause → ... → architectural root
+   - A `clamp()` or `if (bad) return` is NEVER a root cause fix
+2. **Capture the lesson** — write it down where it prevents recurrence:
+   - Code bug → add to knowledge base or rule
+   - Process failure → add to agent rules
+   - Research gap → update methodology skill
+3. **Notify other agents** — if the lesson applies beyond the agent who found it:
+   - AMB: `"LESSON: [what] / SOURCE: [incident] / APPLIES TO: [agents]"`
+4. **Verify prevention** — can the fix be tested? automated? caught in review?
+
+### Pattern Detection
+
+If the same class of problem occurs 3+ times → it's systemic:
+- Not a bug to fix, but a process to redesign
+- Escalate to architect or coach for structural solution
+- Add a hook, rule, or quality gate to prevent the entire class
