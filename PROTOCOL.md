@@ -292,7 +292,7 @@ threads/T{NNN}-{slug}/
 | `AMB_PORT` | yes | TCP port for this agent's daemon |
 | `AMB_HOST` | no | Bind address (default: `127.0.0.1`) |
 | `AMB_BUS_DIR` | no | Directory for runtime files (default: `./bus/`) |
-| `AMB_PEERS` | no | Path to peers.json (default: `./peers.json`) |
+| `AMB_PEERS_FILE` | no | Path to peers.json (default: `{script_dir}/peers.json`) |
 
 ### peers.json
 

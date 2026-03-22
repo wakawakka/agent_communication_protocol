@@ -407,9 +407,11 @@ def cmd_peers():
             sock.close()
             status = "● online" if resp else "○ ?"
             inbox_sz = resp.get("inbox_size", "?") if resp else "?"
+            unread = resp.get("unread", "?") if resp else "?"
             marker = " ← (я)" if name == NAME else ""
+            unread_str = f", unread: {unread}" if unread and unread != 0 else ""
             print(f"  {status}  {name}: {host}:{port} "
-                  f"(inbox: {inbox_sz}){marker}")
+                  f"(total: {inbox_sz}{unread_str}){marker}")
         except (ConnectionError, OSError):
             print(f"  ○ offline  {name}: {host}:{port}")
 
